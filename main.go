@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"io"
 	"log"
@@ -13,52 +15,63 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/nfnt/resize"
 )
 
 type ResponseError struct {
-	Message string
+	HttpStatusCode int
+	Message        string
 }
 
-func responseErrorMsg(w http.ResponseWriter, message string, httpStatusCode int) {
-	m := ResponseError{message}
-	b, err := json.Marshal(m)
+var isErrorResponse = false
+var httpStatusCode = 200
+var responseErrorMsgs = []ResponseError{}
+
+func unsetError() {
+	isErrorResponse = false
+	responseErrorMsgs = []ResponseError{}
+	httpStatusCode = 200
+}
+
+func setError(message string, httpStatusCode int) {
+	isErrorResponse = true
+	m := ResponseError{
+		httpStatusCode,
+		message,
+	}
+	responseErrorMsgs = append(responseErrorMsgs, m)
+}
+
+func setInternalServerError(err error) {
+	setError("Internal server error.", 500)
+	log.Fatal(err)
+}
+
+func getError() []ResponseError {
+	return responseErrorMsgs
+}
+
+func setHTTPStatusCode() {
+	for _, msg := range responseErrorMsgs {
+		if httpStatusCode < msg.HttpStatusCode {
+			httpStatusCode = msg.HttpStatusCode
+		}
+	}
+}
+
+func getHTTPStatusCode() int {
+	return httpStatusCode
+}
+
+func sendError(w http.ResponseWriter) {
+	b, err := json.Marshal(getError())
 	if err != nil {
-		log.Fatal(err)
+		setInternalServerError(err)
 	}
-	s := string(b)
-	fmt.Fprintf(w, s)
-}
-
-func isUrl(qUrl string) bool {
-	_, err := url.ParseRequestURI(qUrl)
-	if err == nil {
-		return true
-	}
-	return false
-}
-
-func isNumber(value string) bool {
-	if _, err := strconv.Atoi(value); err == nil {
-		return true
-	}
-	return false
-}
-
-func validateUrl(qUrl string, w http.ResponseWriter) {
-	if !isUrl(qUrl) {
-		responseErrorMsg(w, "Not a url.", 500)
-	}
-}
-
-func validateWidth(width string, w http.ResponseWriter) {
-	if !isNumber(width) {
-		responseErrorMsg(w, "Width is not a number.", 500)
-	}
-}
-
-func validateHeight(height string, w http.ResponseWriter) {
-	if !isNumber(height) {
-		responseErrorMsg(w, "Height is not a number.", 500)
+	if isErrorResponse {
+		setHTTPStatusCode()
+		http.Error(w, string(b), getHTTPStatusCode())
 	}
 }
 
@@ -74,18 +87,16 @@ func isImage(contentType string) bool {
 	return false
 }
 
-func validateImage(imagePath string, w http.ResponseWriter) {
+func validateImage(imagePath string) {
 	tmpFile, err := os.Open(imagePath)
 	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
+		setInternalServerError(err)
 	}
 
 	buff := make([]byte, 512)
 	_, err = tmpFile.Read(buff)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		setInternalServerError(err)
 	}
 
 	contentType := http.DetectContentType(buff)
@@ -93,95 +104,152 @@ func validateImage(imagePath string, w http.ResponseWriter) {
 	tmpFile.Close()
 
 	if !isImage(contentType) {
-		responseErrorMsg(w, "The URL is not an image.", 500)
+		// 415 HTTP Status Code: Unsupported Media Type
+		setError("The URL is not an image.", 415)
 	}
 }
 
-func downloadImage(qUrl string, w http.ResponseWriter) {
+func downloadImage(qUrl string) (string, error) {
 	response, err := http.Get(qUrl)
 	//http.DetectContentType(response)
 	if err != nil {
-		log.Fatal(err)
+		setInternalServerError(err)
+		return "", err
 	}
 
 	defer response.Body.Close()
 
-	//open a file for writing
-	file, err := os.Create("/tmp/asdf.jpg")
+	currPath, err := filepath.Abs("./")
 	if err != nil {
-		log.Fatal(err)
+		setInternalServerError(err)
+	}
+	currPath += "/"
+
+	os.MkdirAll(currPath+"imgs/orig", 0777)
+	os.MkdirAll(currPath+"imgs/resized", 0777)
+
+	name := filepath.Base(qUrl)
+
+	//open a file for writing
+	file, err := os.Create("/tmp/" + name)
+	if err != nil {
+		setInternalServerError(err)
+		return "", err
 	}
 
 	// Use io.Copy to just dump the response body to the file. This supports huge files
 	_, err = io.Copy(file, response.Body)
 	if err != nil {
-		log.Fatal(err)
+		setInternalServerError(err)
+		return "", err
 	}
 
 	file.Close()
 
-	validateImage("/tmp/asdf.jpg", w)
+	validateImage("/tmp/" + name)
 
-	fmt.Fprintf(w, "Success!")
+	return name, err
 }
 
-func resizeImage(imagePath string, width int, height int) {
-	infile := "asdf.jpg"
+func imageResizeName(imageFileName string, width, height int) string {
+	infile := imageFileName
 	ext := filepath.Ext(infile) // e.g., ".jpg", ".JPEG"
-	outfile := strings.TrimSuffix(infile, ext) + ".thumb" + ext
+	size := fmt.Sprintf(".%dx%d", width, height)
+	return strings.TrimSuffix(infile, ext) + size + ".thumb" + ext
+}
+
+func resizeImage(width, height int, infile string) {
+	outfile := imageResizeName(infile, width, height)
 
 	file, err := os.Open("/tmp/" + infile)
 	if err != nil {
-		log.Fatal(err)
+		setInternalServerError(err)
 	}
-	defer file.Close()
+
+	// decode jpeg into image.Image
+	img, err := jpeg.Decode(file)
+	if err != nil {
+		setInternalServerError(err)
+	}
+
+	file.Close()
+
+	// Documentaion on interpolation opions:
+	// https://www.cambridgeincolour.com/tutorials/image-resize-for-web.htm
+	m := resize.Thumbnail(uint(width), uint(height), img, resize.Bicubic)
+
+	mb := m.Bounds()
+	origWidth := mb.Dx()
+	origHeight := mb.Dy()
+	paddingTop := (height / 2) - (origHeight / 2)
+	paddingLeft := (width / 2) - (origWidth / 2)
+
+	myimageOffset := image.Pt(0, 0)
+	myimageRect := image.Rect(0, 0, width, height)
+	myimage := image.NewRGBA(myimageRect)
+	black := color.RGBA{0, 0, 0, 0}
+	draw.Draw(myimage, myimage.Bounds().Add(myimageOffset), &image.Uniform{black}, image.ZP, draw.Src)
+
+	b := myimage.Bounds().Add(image.Pt(-paddingLeft, -paddingTop))
+	image3 := image.NewRGBA(b)
+	draw.Draw(image3, m.Bounds(), m, image.ZP, draw.Over)
 
 	out, err := os.Create(outfile)
 	if err != nil {
-		log.Fatal(err)
+		setInternalServerError(err)
 	}
 
-	src, _, err := image.Decode(file)
+	defer out.Close()
+
+	// write new image to file
+	jpeg.Encode(out, image3, &jpeg.Options{jpeg.DefaultQuality})
+}
+
+func validateUrl(qUrl string) (string, error) {
+	_, err := url.ParseRequestURI(qUrl)
 	if err != nil {
-		log.Fatal(err)
+		setError("Not a url.", 400)
 	}
 
-	jpeg.Encode(out, dst, nil)
+	return qUrl, err
+}
 
+func validateSize(sizeStr string, name string) (int, error) {
+	size, err := strconv.Atoi(sizeStr)
+	if err != nil {
+		setError(name+" param is not a number.", 400)
+	} else if size < 1 {
+		setError(name+" param number is too small.", 400)
+	}
+
+	return size, err
+}
+
+func createThumbnail(w http.ResponseWriter, r *http.Request) {
+	urlQuery := r.URL.Query()
+
+	url, _ := validateUrl(urlQuery.Get("url"))
+	width, _ := validateSize(urlQuery.Get("width"), "Width")
+	height, _ := validateSize(urlQuery.Get("height"), "Height")
+
+	if !isErrorResponse {
+		name, _ := downloadImage(url)
+		resizeImage(width, height, name)
+	}
 }
 
 func main() {
-	http.HandleFunc("/thumbnail", func(w http.ResponseWriter, r *http.Request) {
-		urlQuery := r.URL.Query()
 
-		qUrl := urlQuery.Get("url")
-		qWidth := urlQuery.Get("width")
-		qHeight := urlQuery.Get("height")
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Content-Type", "application/json")
+		unsetError()
 
-		validateUrl(qUrl, w)
-		validateWidth(qWidth, w)
-		validateHeight(qHeight, w)
-
-		//fmt.Fprintf(w, "Hello Gopher thumbnail\n")
-		fmt.Fprintf(w, qUrl+"\n")
-		fmt.Fprintf(w, qWidth+"\n")
-		fmt.Fprintf(w, qHeight+"\n")
-
-		width, err := strconv.Atoi(qWidth)
-		if err != nil {
-			log.Fatal(err)
+		if r.URL.Path == "/thumbnail" {
+			createThumbnail(w, r)
+		} else {
+			setError("Not Found", 404)
 		}
-
-		height, err := strconv.Atoi(qHeight)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		resizeImage(width, height)
-
-		//downloadImage(qUrl, w)
-
-		w.Header().Add("Server", "Thumbnail Web Service Server")
+		sendError(w)
 	})
 
 	http.ListenAndServe(":3000", nil)
