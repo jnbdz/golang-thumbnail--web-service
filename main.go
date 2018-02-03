@@ -19,6 +19,14 @@ import (
 	"github.com/nfnt/resize"
 )
 
+var currentDirPath string
+var origDirPath string
+var resizedDirPath string
+var origImgPath string
+var resizedImgPath string
+var imgOrigName string
+var imgResizedName string
+
 type ResponseError struct {
 	HttpStatusCode int
 	Message        string
@@ -109,9 +117,109 @@ func validateImage(imagePath string) {
 	}
 }
 
+func setCurrentDirPath() {
+	currPath, err := filepath.Abs("./")
+	if err != nil {
+		setInternalServerError(err)
+	}
+	currPath += "/"
+
+	currentDirPath = currPath
+}
+
+func getCurrentDirPath() string {
+	if currentDirPath == "" {
+		setCurrentDirPath()
+	}
+	return currentDirPath
+}
+
+func setOrigDirPath() {
+	origDirPath = getCurrentDirPath() + "imgs/orig/"
+}
+
+func getOrigDirPath() string {
+	if origDirPath == "" {
+		setOrigDirPath()
+	}
+	return origDirPath
+}
+
+func setResizedDirPath() {
+	resizedDirPath = getCurrentDirPath() + "imgs/resized/"
+}
+
+func getResizedDirPath() string {
+	if resizedDirPath == "" {
+		setResizedDirPath()
+	}
+	return resizedDirPath
+}
+
+func setOrigImgPath() {
+	origImgPath = getOrigDirPath() + getImgOrigName()
+}
+
+func getOrigImgPath() string {
+	if origImgPath == "" {
+		setOrigImgPath()
+	}
+	return origImgPath
+}
+
+func setResizedImgPath() {
+	resizedImgPath = getResizedDirPath() + getImgResizedName()
+}
+
+func getResizedImgPath() string {
+	if resizedImgPath == "" {
+		setResizedImgPath()
+	}
+	return resizedImgPath
+}
+
+func setImgOrigName(name string) {
+	imgOrigName = name
+}
+
+func getImgOrigName() string {
+	return imgOrigName
+}
+
+func setImgResizedName(name string) {
+	imgResizedName = name
+}
+
+func getImgResizedName() string {
+	return imgResizedName
+}
+
+func addImgDirs() {
+
+	origPath := getOrigDirPath()
+	resizedPath := getResizedDirPath()
+
+	if stat, err := os.Stat(origPath); err == nil && stat.IsDir() {
+		err = os.MkdirAll(origPath, 0777)
+		if err != nil {
+			setInternalServerError(err)
+		}
+	} else {
+		setInternalServerError(err)
+	}
+
+	if stat, err := os.Stat(origPath); err == nil && stat.IsDir() {
+		err = os.MkdirAll(resizedPath, 0777)
+		if err != nil {
+			setInternalServerError(err)
+		}
+	} else {
+		setInternalServerError(err)
+	}
+}
+
 func downloadImage(qUrl string) (string, error) {
 	response, err := http.Get(qUrl)
-	//http.DetectContentType(response)
 	if err != nil {
 		setInternalServerError(err)
 		return "", err
@@ -119,19 +227,13 @@ func downloadImage(qUrl string) (string, error) {
 
 	defer response.Body.Close()
 
-	currPath, err := filepath.Abs("./")
-	if err != nil {
-		setInternalServerError(err)
-	}
-	currPath += "/"
-
-	os.MkdirAll(currPath+"imgs/orig", 0777)
-	os.MkdirAll(currPath+"imgs/resized", 0777)
+	addImgDirs()
 
 	name := filepath.Base(qUrl)
+	setImgOrigName(name)
 
 	//open a file for writing
-	file, err := os.Create("/tmp/" + name)
+	file, err := os.Create(getOrigImgPath())
 	if err != nil {
 		setInternalServerError(err)
 		return "", err
@@ -146,14 +248,14 @@ func downloadImage(qUrl string) (string, error) {
 
 	file.Close()
 
-	validateImage("/tmp/" + name)
+	validateImage(getOrigImgPath())
 
 	return name, err
 }
 
 func imageResizeName(imageFileName string, width, height int) string {
 	infile := imageFileName
-	ext := filepath.Ext(infile) // e.g., ".jpg", ".JPEG"
+	ext := filepath.Ext(infile)
 	size := fmt.Sprintf(".%dx%d", width, height)
 	return strings.TrimSuffix(infile, ext) + size + ".thumb" + ext
 }
@@ -161,7 +263,9 @@ func imageResizeName(imageFileName string, width, height int) string {
 func resizeImage(width, height int, infile string) {
 	outfile := imageResizeName(infile, width, height)
 
-	file, err := os.Open("/tmp/" + infile)
+	setImgResizedName(outfile)
+
+	file, err := os.Open(getResizedImgPath())
 	if err != nil {
 		setInternalServerError(err)
 	}
@@ -239,7 +343,6 @@ func createThumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("Content-Type", "application/json")
 		unsetError()
